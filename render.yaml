@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: adzoho-telegram-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_PASSWORD
+        value: ADZOHO2026
+      - key: WHATSAPP_LINK
+        value: https://wa.me/15819052863
+      - key: DATABASE_PATH
+        value: adzoho_bot.db
+      - key: LOG_LEVEL
+        value: INFO
