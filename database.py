@@ -124,7 +124,7 @@ class Database:
         last_name: str | None,
         source_chat_id: int | None = None,
     ) -> bool:
-        """Insert a new lead. Returns True if inserted, False if duplicate."""
+        """Insert a new lead. If already exists, update details. Returns True if new, False if existing."""
         now = self._now()
         try:
             await self._db.execute(
@@ -139,7 +139,18 @@ class Database:
             logger.info("New lead added: %s (%s)", user_id, username)
             return True
         except aiosqlite.IntegrityError:
-            logger.debug("Lead already exists: %s", user_id)
+            logger.debug("Lead already exists: %s, updating info", user_id)
+            await self._db.execute(
+                """UPDATE leads
+                   SET username = COALESCE(?, username),
+                       first_name = COALESCE(?, first_name),
+                       last_name = COALESCE(?, last_name),
+                       source_chat_id = COALESCE(?, source_chat_id),
+                       updated_at = ?
+                   WHERE user_id = ?""",
+                (username, first_name, last_name, source_chat_id, now, user_id),
+            )
+            await self._db.commit()
             return False
 
     async def get_lead(self, user_id: int) -> dict | None:

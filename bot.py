@@ -135,17 +135,71 @@ async def _whatsapp_button() -> InlineKeyboardMarkup:
     )
 
 
-async def _render(template_key: str, first_name: str) -> str | None:
+async def _render(template_key: str, first_name: str | None) -> str | None:
     """Fetch a template from DB, fill placeholders, return text."""
     text = await db.get_template(template_key)
     if not text:
         return None
     wa = await _whatsapp_link()
-    return text.format(
-        first_name=html.escape(first_name or "there"),
-        whatsapp_link=wa,
-        bot_name="ADZOHO",
+    # Sanitize user first_name so special characters don't break Telegram Markdown parser
+    raw_name = first_name or "there"
+    safe_name = (
+        raw_name.replace("*", "")
+        .replace("_", "")
+        .replace("`", "")
+        .replace("[", "")
+        .replace("]", "")
     )
+    try:
+        return text.format(
+            first_name=safe_name,
+            whatsapp_link=wa,
+            bot_name="ADZOHO",
+        )
+    except Exception as e:
+        logger.error("Error formatting template %s: %s", template_key, e)
+        return text
+
+
+async def _send_safe_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
+    """Send message with Markdown, falling back to plain text if Markdown parsing fails."""
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
+            disable_web_page_preview=False,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "Markdown send failed for chat %d (%s), retrying as plain text...",
+            chat_id, e,
+        )
+        try:
+            clean_text = (
+                text.replace("*", "")
+                .replace("_", "")
+                .replace("`", "")
+                .replace("[", "")
+                .replace("]", "")
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=clean_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=False,
+            )
+            return True
+        except Exception as e2:
+            logger.error("Failed to send message to chat %d: %s", chat_id, e2)
+            return False
 
 
 async def _is_admin(user_id: int) -> bool:
@@ -317,15 +371,9 @@ async def _execute_followup(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
-    try:
-        wa_kb = await _whatsapp_button()
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=wa_kb,
-            disable_web_page_preview=False,
-        )
+    wa_kb = await _whatsapp_button()
+    sent = await _send_safe_message(context, user_id, text, wa_kb)
+    if sent:
         await db.log_message(user_id, template_key, stage)
         await db.update_lead_last_message(user_id)
 
@@ -348,10 +396,10 @@ async def _execute_followup(context: ContextTypes.DEFAULT_TYPE) -> None:
             "Sent followup stage %d (%s) to user %d",
             stage, template_key, user_id,
         )
-    except Exception as e:
+    else:
         logger.error(
-            "Failed to send followup stage %d to user %d: %s",
-            stage, user_id, e,
+            "Failed to send followup stage %d to user %d",
+            stage, user_id,
         )
 
 
@@ -375,50 +423,54 @@ async def handle_join_request(
     """Auto-approve the channel join request, send welcome, schedule follow-ups."""
     request: ChatJoinRequest = update.chat_join_request
     user = request.from_user
+    target_chat_id = getattr(request, "user_chat_id", None) or user.id
 
-    # 1) Approve
+    logger.info(
+        "Join request received from user %d (@%s, name=%s) for chat %d (target_chat_id=%s)",
+        user.id, user.username, user.first_name, request.chat.id, target_chat_id,
+    )
+
+    # 1) Send welcome DM FIRST using target_chat_id while join request grants active contact rights
+    welcome_sent = False
+    lead = await db.get_lead(user.id)
+    if lead and lead.get("opted_out"):
+        logger.info("Lead %d has opted out, skipping welcome message.", user.id)
+    else:
+        text = await _render("welcome", user.first_name)
+        if text:
+            wa_kb = await _whatsapp_button()
+            welcome_sent = await _send_safe_message(context, target_chat_id, text, wa_kb)
+            if welcome_sent:
+                await db.log_message(user.id, "welcome")
+                logger.info("Delivered welcome DM to user %d", user.id)
+            else:
+                logger.warning("Could not deliver welcome DM to target_chat_id %d", target_chat_id)
+
+    # 2) Approve the join request
     try:
         await request.approve()
         logger.info(
-            "Approved join request: %d (%s) for chat %d",
+            "Approved join request: %d (@%s) for chat %d",
             user.id, user.username, request.chat.id,
         )
     except Exception as e:
         logger.error("Failed to approve join request: %s", e)
-        return
 
-    # 2) Register lead
-    is_new = await db.add_lead(
+    # 3) Register or update lead in DB
+    await db.add_lead(
         user_id=user.id,
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
         source_chat_id=request.chat.id,
     )
+    if welcome_sent:
+        await db.update_lead_last_message(user.id)
 
-    if not is_new:
-        logger.info("Returning lead %d, skipping welcome.", user.id)
-        return
-
-    # 3) Send welcome DM
-    text = await _render("welcome", user.first_name)
-    if text:
-        try:
-            wa_kb = await _whatsapp_button()
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=wa_kb,
-            )
-            await db.log_message(user.id, "welcome")
-            await db.update_lead_last_message(user.id)
-            logger.info("Sent welcome to %d", user.id)
-        except Exception as e:
-            logger.error("Could not DM user %d: %s", user.id, e)
-
-    # 4) Schedule follow-ups
-    await schedule_followups(user.id, context.application)
+    # 4) Schedule follow-ups if lead is active
+    lead = await db.get_lead(user.id)
+    if lead and not lead.get("opted_out") and lead.get("status") not in config.TERMINAL_STATUSES:
+        await schedule_followups(user.id, context.application)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -438,18 +490,17 @@ async def handle_start(
         last_name=user.last_name,
     )
 
-    wa = await _whatsapp_link()
     wa_kb = await _whatsapp_button()
+    safe_name = (user.first_name or "there").replace("*", "").replace("_", "").replace("`", "")
     text = (
-        f"👋 Hi *{html.escape(user.first_name or 'there')}!*\n\n"
+        f"👋 Hi *{safe_name}!*\n\n"
         "Welcome to *ADZOHO* — your growth partner in digital advertising.\n\n"
         "Need digital marketing services?\n"
         "Tap the button below to discuss your requirements with our team.\n\n"
         "Type /help for available commands."
     )
-    await update.message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, reply_markup=wa_kb
-    )
+    if update.message:
+        await _send_safe_message(context, user.id, text, wa_kb)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1266,20 +1317,26 @@ async def _cb_broadcast_confirm(query, context) -> None:
 
     for lead in leads:
         try:
+            raw_name = lead["first_name"] or "there"
+            safe_name = (
+                raw_name.replace("*", "")
+                .replace("_", "")
+                .replace("`", "")
+                .replace("[", "")
+                .replace("]", "")
+            )
             msg = text.format(
-                first_name=html.escape(lead["first_name"] or "there"),
+                first_name=safe_name,
                 whatsapp_link=wa,
                 bot_name="ADZOHO",
             )
-            await context.bot.send_message(
-                chat_id=lead["user_id"],
-                text=msg,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=wa_kb,
-            )
-            await db.log_message(lead["user_id"], "broadcast")
-            await db.update_lead_last_message(lead["user_id"])
-            sent += 1
+            ok = await _send_safe_message(context, lead["user_id"], msg, wa_kb)
+            if ok:
+                await db.log_message(lead["user_id"], "broadcast")
+                await db.update_lead_last_message(lead["user_id"])
+                sent += 1
+            else:
+                failed += 1
         except Exception as e:
             logger.error("Broadcast failed for %d: %s", lead["user_id"], e)
             failed += 1
@@ -1456,14 +1513,9 @@ async def _cb_manual_followup(query, context, data: str) -> None:
         await query.answer("❌ Template not found", show_alert=True)
         return
 
-    try:
-        wa_kb = await _whatsapp_button()
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=wa_kb,
-        )
+    wa_kb = await _whatsapp_button()
+    sent = await _send_safe_message(context, user_id, text, wa_kb)
+    if sent:
         await db.log_message(user_id, template_key, next_stage)
         await db.update_lead_last_message(user_id)
 
@@ -1482,8 +1534,8 @@ async def _cb_manual_followup(query, context, data: str) -> None:
 
         await query.answer(f"✅ Sent {template_key}!")
         await _cb_lead_detail(query, context, f"ld:{user_id}")
-    except Exception as e:
-        await query.answer(f"❌ Failed: {e}", show_alert=True)
+    else:
+        await query.answer("❌ Failed to send follow-up message", show_alert=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════
