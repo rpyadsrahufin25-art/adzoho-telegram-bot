@@ -19,6 +19,7 @@ from typing import Any
 
 from telegram import (
     Bot,
+    BotCommand,
     ChatJoinRequest,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -205,6 +206,12 @@ async def _seed_defaults() -> None:
         await db.set_setting("super_admin_password", config.SUPER_ADMIN_PASSWORD)
     if await db.get_setting("normal_admin_password") is None:
         await db.set_setting("normal_admin_password", config.NORMAL_ADMIN_PASSWORD)
+
+    # Wipe all previously saved admins so only active password entries can open dashboard
+    if not await db.get_setting("legacy_admins_cleared_v2"):
+        await db.clear_all_admins()
+        await db.set_setting("legacy_admins_cleared_v2", "1")
+        logger.info("Wiped all legacy admin sessions. Passcode required.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -452,21 +459,14 @@ async def handle_start(
 async def handle_help(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    user = update.effective_user
     text = (
         "📖 *ADZOHO Bot Commands*\n\n"
         "/start — Start the bot\n"
         "/help — Show this help\n"
         "/whatsapp — Get our WhatsApp link\n"
         "/telegramsupport — Chat with @Adzoho on Telegram\n"
-        "/stop — Opt out of messages\n"
+        "/stop — Opt out of messages"
     )
-    # Only show admin commands to actual admins
-    if await _is_admin(user.id):
-        text += (
-            "\n🔐 *Admin Commands:*\n"
-            "/admin — Open admin dashboard\n"
-        )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1724,6 +1724,19 @@ async def post_init(application: Application) -> None:
     await db.connect()
     await _seed_defaults()
     await _reload_pending_followups(application)
+
+    # Set public commands only (keeping /admin completely hidden)
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Show help and services"),
+            BotCommand("whatsapp", "Chat on WhatsApp"),
+            BotCommand("telegramsupport", "Contact @Adzoho on Telegram"),
+            BotCommand("stop", "Opt out of automated messages"),
+        ])
+    except Exception as e:
+        logger.debug("Could not set bot commands: %s", e)
+
     # Prevent Render free tier from sleeping by self-pinging every 10 minutes
     if os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL"):
         application.job_queue.run_repeating(_self_ping, interval=600, first=60)
