@@ -99,24 +99,25 @@ You can host this bot on [Render.com](https://render.com) in 5 minutes:
 ### Step 1: Push project to GitHub
 Create a private GitHub repository and push this `adzoho-bot` directory.
 
-### Step 2: Create a Background Worker on Render
+### Step 2: Create a Web Service on Render (100% Free)
 1. Log in to [Render Dashboard](https://dashboard.render.com).
-2. Click **New +** → **Background Worker**.
-3. Connect your GitHub repository.
+2. Click **New +** → **Web Service** *(Choose Web Service, which is 100% FREE!)*.
+3. Connect your GitHub repository: `rpyadsrahufin25-art/adzoho-telegram-bot`.
 4. Set the following settings:
    - **Name:** `adzoho-bot`
    - **Environment:** `Python 3`
+   - **Plan:** Select **Free** ($0/month)
    - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `python bot.py`
 5. Under **Environment Variables**, add:
    - `BOT_TOKEN`: `your_telegram_bot_token`
-   - `ADMIN_PASSWORD`: `your_secret_admin_passcode` (e.g. `ADZOHO2026`)
+   - `ADMIN_PASSWORD`: `ADZOHO2026`
    - `WHATSAPP_LINK`: `https://wa.me/15819052863`
    - `DATABASE_PATH`: `adzoho_bot.db`
    - `LOG_LEVEL`: `INFO`
-6. Click **Create Background Worker**!
+6. Click **Create Web Service**!
 
-*(Optional: For persistent storage across free tier redeploys, you can attach a Render Disk at `/data` and set `DATABASE_PATH=/data/adzoho_bot.db`)*
+The bot runs a lightweight HTTP health check endpoint on `$PORT` so Render recognizes it as an active Web Service. The bot also automatically pings its own URL every 10 minutes to prevent Render's free tier from sleeping!
 
 ---
 

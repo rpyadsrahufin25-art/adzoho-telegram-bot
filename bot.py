@@ -10,8 +10,11 @@ import html
 import io
 import logging
 import math
+import os
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 from telegram import (
@@ -66,6 +69,47 @@ logger = logging.getLogger("adzoho")
 db: Database = Database(config.DATABASE_PATH)
 
 PER_PAGE = 8  # leads per page in admin list
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Health Server (Enables 100% FREE deployment on Render Web Services)
+# ═════════════════════════════════════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - ADZOHO Telegram Bot is running!")
+
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP access noise in logs
+
+
+def start_health_server() -> None:
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return
+    try:
+        port = int(port_str)
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info("Health server listening on port %d (Render Free Web Service active)", port)
+    except Exception as e:
+        logger.warning("Could not start health server on port %s: %s", port_str, e)
+
+
+async def _self_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL")
+    if url:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url)
+                logger.debug("Self-ping to %s returned %d", url, resp.status_code)
+        except Exception as e:
+            logger.debug("Self-ping failed: %s", e)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1556,6 +1600,10 @@ async def post_init(application: Application) -> None:
     await db.connect()
     await _seed_defaults()
     await _reload_pending_followups(application)
+    # Prevent Render free tier from sleeping by self-pinging every 10 minutes
+    if os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL"):
+        application.job_queue.run_repeating(_self_ping, interval=600, first=60)
+        logger.info("Scheduled keep-alive self-ping every 10 minutes (Render Free tier mode)")
     logger.info("ADZOHO bot initialized ✅")
 
 
@@ -1584,6 +1632,9 @@ def main() -> None:
 
     logger.info("Admin security initialized. Owner: %d, Passcode set: %s",
                 config.SUPER_ADMIN_ID, bool(config.ADMIN_PASSWORD))
+
+    # Start health server for Render Free Web Service (if PORT is set)
+    start_health_server()
 
     app = (
         Application.builder()
