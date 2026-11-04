@@ -13,19 +13,15 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 DATABASE_PATH: str = os.getenv("DATABASE_PATH", "adzoho_bot.db")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-# ── Admin ────────────────────────────────────────────────────────────────
-# Telegram user-id of the bot owner. Optional if ADMIN_PASSWORD is set.
-SUPER_ADMIN_ID: int = int(os.getenv("SUPER_ADMIN_ID", "0"))
+# ── Admin Passcodes ──────────────────────────────────────────────────────
+# Tier 1: Super Admin (Owner - full control, settings, passwords, export, broadcast)
+SUPER_ADMIN_PASSWORD: str = os.getenv("SUPER_ADMIN_PASSWORD", "ADZOHO_SUPER_2026")
 
-# Secret password/passcode to unlock admin access from Telegram
-ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "ADZOHO2026")
+# Tier 2: Normal Admin (Team / Staff - stats, leads, search, follow-ups)
+NORMAL_ADMIN_PASSWORD: str = os.getenv("NORMAL_ADMIN_PASSWORD", "ADZOHO_ADMIN_2026")
 
-# Additional admin IDs (comma-separated in .env, e.g. "123,456,789")
-_extra = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS: list[int] = (
-    [int(x.strip()) for x in _extra.split(",") if x.strip().isdigit()]
-    if _extra else []
-)
+# ── Support ──────────────────────────────────────────────────────────────
+TELEGRAM_SUPPORT_USERNAME: str = os.getenv("TELEGRAM_SUPPORT_USERNAME", "Adzoho")
 
 # ── WhatsApp ─────────────────────────────────────────────────────────────
 WHATSAPP_DEFAULT: str = os.getenv(

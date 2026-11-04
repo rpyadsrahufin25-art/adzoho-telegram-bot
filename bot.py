@@ -60,8 +60,9 @@ logger = logging.getLogger("adzoho")
     STATE_ADD_NOTE,
     STATE_SEARCH,
     STATE_AUTH_PASSWORD,
-    STATE_SET_PASSWORD,
-) = range(8)
+    STATE_SET_SUPER_PASSWORD,
+    STATE_SET_NORMAL_PASSWORD,
+) = range(9)
 
 # ═════════════════════════════════════════════════════════════════════════
 # Globals (set during startup)
@@ -147,12 +148,13 @@ async def _render(template_key: str, first_name: str) -> str | None:
 
 
 async def _is_admin(user_id: int) -> bool:
-    """Check if user is the owner, a configured admin, or a DB admin."""
-    if user_id == config.SUPER_ADMIN_ID:
-        return True
-    if user_id in config.ADMIN_IDS:
-        return True
+    """Check if user has authenticated as an admin via passcode."""
     return await db.is_admin(user_id)
+
+
+async def _is_super_admin(user_id: int) -> bool:
+    """Check if user has Super Admin privileges."""
+    return await db.is_super_admin(user_id)
 
 
 def _lead_display_name(lead: dict) -> str:
@@ -198,13 +200,11 @@ async def _seed_defaults() -> None:
         if await db.get_setting(key) is None:
             await db.set_setting(key, str(days))
 
-    # Register super admin (REQUIRED from .env)
-    if config.SUPER_ADMIN_ID:
-        await db.add_admin(config.SUPER_ADMIN_ID, None, is_super=True)
-
-    # Register any extra admins from .env
-    for aid in config.ADMIN_IDS:
-        await db.add_admin(aid, None, is_super=False)
+    # Seed admin passwords if not set
+    if await db.get_setting("super_admin_password") is None:
+        await db.set_setting("super_admin_password", config.SUPER_ADMIN_PASSWORD)
+    if await db.get_setting("normal_admin_password") is None:
+        await db.set_setting("normal_admin_password", config.NORMAL_ADMIN_PASSWORD)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -457,8 +457,9 @@ async def handle_help(
         "📖 *ADZOHO Bot Commands*\n\n"
         "/start — Start the bot\n"
         "/help — Show this help\n"
-        "/stop — Opt out of messages\n"
         "/whatsapp — Get our WhatsApp link\n"
+        "/telegramsupport — Chat with @Adzoho on Telegram\n"
+        "/stop — Opt out of messages\n"
     )
     # Only show admin commands to actual admins
     if await _is_admin(user.id):
@@ -467,6 +468,29 @@ async def handle_help(
             "/admin — Open admin dashboard\n"
         )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# HANDLER: /telegramsupport
+# ═════════════════════════════════════════════════════════════════════════
+
+async def handle_telegram_support(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    username = config.TELEGRAM_SUPPORT_USERNAME.lstrip("@")
+    url = f"https://t.me/{username}"
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"💬 Contact @{username} on Telegram", url=url)]]
+    )
+    text = (
+        f"💬 *ADZOHO Telegram Support*\n\n"
+        f"Need direct assistance or want to discuss a project on Telegram?\n"
+        f"Reach out directly to our team at @{username}.\n\n"
+        f"Tap the button below to open a direct chat! 👇"
+    )
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -527,34 +551,52 @@ async def _admin_guard(update: Update) -> bool:
     return True
 
 
-def _main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+def _main_menu_keyboard(is_super: bool = True) -> InlineKeyboardMarkup:
+    if is_super:
+        return InlineKeyboardMarkup(
             [
-                InlineKeyboardButton("📊 Statistics", callback_data="s"),
-                InlineKeyboardButton("👥 Leads", callback_data="l:1"),
-            ],
+                [
+                    InlineKeyboardButton("📊 Statistics", callback_data="s"),
+                    InlineKeyboardButton("👥 Leads", callback_data="l:1"),
+                ],
+                [
+                    InlineKeyboardButton("📝 Templates", callback_data="t"),
+                    InlineKeyboardButton("⚙️ Settings", callback_data="st"),
+                ],
+                [
+                    InlineKeyboardButton("📢 Broadcast", callback_data="bc"),
+                    InlineKeyboardButton("📥 Export CSV", callback_data="ex"),
+                ],
+                [
+                    InlineKeyboardButton("🔍 Search", callback_data="sr"),
+                    InlineKeyboardButton("👤 Admins", callback_data="ad"),
+                ],
+            ]
+        )
+    else:
+        return InlineKeyboardMarkup(
             [
-                InlineKeyboardButton("📝 Templates", callback_data="t"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="st"),
-            ],
-            [
-                InlineKeyboardButton("📢 Broadcast", callback_data="bc"),
-                InlineKeyboardButton("📥 Export CSV", callback_data="ex"),
-            ],
-            [
-                InlineKeyboardButton("🔍 Search", callback_data="sr"),
-                InlineKeyboardButton("👤 Admins", callback_data="ad"),
-            ],
-        ]
-    )
+                [
+                    InlineKeyboardButton("📊 Statistics", callback_data="s"),
+                    InlineKeyboardButton("👥 Leads", callback_data="l:1"),
+                ],
+                [
+                    InlineKeyboardButton("📝 Templates", callback_data="t"),
+                    InlineKeyboardButton("🔍 Search", callback_data="sr"),
+                ],
+            ]
+        )
 
 
 async def _show_dashboard(update: Update) -> None:
+    user = update.effective_user
+    is_super = await _is_super_admin(user.id) if user else False
+    role_badge = "👑 *Super Admin*" if is_super else "🔑 *Team Admin*"
+
     stats = await db.get_lead_stats()
     total = stats.get("Total", 0)
     text = (
-        "🏠 *ADZOHO Admin Dashboard*\n\n"
+        f"🏠 *ADZOHO Admin Dashboard* — {role_badge}\n\n"
         f"📊 Total Leads: *{total}*\n"
     )
     for status_name in [*config.STATUSES, "Opted Out"]:
@@ -568,12 +610,12 @@ async def _show_dashboard(update: Update) -> None:
             await msg.reply_text(
                 text,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_main_menu_keyboard(),
+                reply_markup=_main_menu_keyboard(is_super),
             )
         except Exception:
             await msg.reply_text(
                 text.replace("*", ""),
-                reply_markup=_main_menu_keyboard(),
+                reply_markup=_main_menu_keyboard(is_super),
             )
 
 
@@ -591,8 +633,10 @@ async def admin_panel(
     msg = update.effective_message
     if msg:
         await msg.reply_text(
-            "🔐 *Admin Authentication*\n\n"
-            "Please enter the *Admin Passcode* to access the dashboard:\n\n"
+            "🔐 *ADZOHO Admin Authentication*\n\n"
+            "Please enter your admin passcode to access the dashboard:\n"
+            "• *Super Admin Passcode* (Full owner privileges)\n"
+            "• *Normal Admin Passcode* (Team / Staff access)\n\n"
             "_(Send /cancel to abort)_",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -608,23 +652,36 @@ async def _handle_auth_password(
         return ConversationHandler.END
 
     entered_pass = msg.text.strip()
-    current_pass = await db.get_setting("admin_password") or config.ADMIN_PASSWORD
+    super_pass = await db.get_setting("super_admin_password") or config.SUPER_ADMIN_PASSWORD
+    normal_pass = await db.get_setting("normal_admin_password") or config.NORMAL_ADMIN_PASSWORD
 
-    if entered_pass == current_pass:
-        await db.add_admin(user.id, user.username, is_super=True)
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
+    if entered_pass == super_pass:
+        await db.add_or_update_admin(user.id, user.username, is_super=True)
         await msg.reply_text(
-            f"🎉 *Access Granted!*\n\n"
-            f"Welcome, {html.escape(user.first_name or 'Admin')}! You are now authorized as an administrator.\n"
+            f"👑 *Super Admin Access Granted!*\n\n"
+            f"Welcome, {html.escape(user.first_name or 'Owner')}! You have full owner privileges.\n"
             f"Use /admin anytime to open your dashboard.",
             parse_mode=ParseMode.MARKDOWN,
         )
         await _show_dashboard(update)
         return ConversationHandler.END
+
+    elif entered_pass == normal_pass:
+        await db.add_or_update_admin(user.id, user.username, is_super=False)
+        await msg.reply_text(
+            f"🔑 *Team Admin Access Granted!*\n\n"
+            f"Welcome, {html.escape(user.first_name or 'Admin')}! You have team admin access.\n"
+            f"Use /admin anytime to open your dashboard.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await _show_dashboard(update)
+        return ConversationHandler.END
+
     else:
         await msg.reply_text("❌ Incorrect passcode. Access denied.")
         return ConversationHandler.END
@@ -681,8 +738,12 @@ async def handle_callback(
         return await _cb_settings(query, context)
     if data == "st:wa":
         return await _cb_set_whatsapp_start(query, context)
-    if data == "st:pass":
-        return await _cb_set_password_start(query, context)
+    if data == "st:spass":
+        return await _cb_set_super_password_start(query, context)
+    if data == "st:npass":
+        return await _cb_set_normal_password_start(query, context)
+    if data == "st:clear_admins":
+        return await _cb_clear_admins(query, context)
 
     # ── Broadcast ────────────────────────────────────────────────────
     if data == "bc":
@@ -724,10 +785,14 @@ async def handle_callback(
 # ── Callback implementations ────────────────────────────────────────────
 
 async def _cb_main_menu(query, context) -> None:
+    user = query.from_user
+    is_super = await _is_super_admin(user.id) if user else False
+    role_badge = "👑 *Super Admin*" if is_super else "🔑 *Team Admin*"
+
     stats = await db.get_lead_stats()
     total = stats.get("Total", 0)
     text = (
-        "🏠 *ADZOHO Admin Dashboard*\n\n"
+        f"🏠 *ADZOHO Admin Dashboard* — {role_badge}\n\n"
         f"📊 Total Leads: *{total}*\n"
     )
     for status_name in [*config.STATUSES, "Opted Out"]:
@@ -738,7 +803,7 @@ async def _cb_main_menu(query, context) -> None:
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_main_menu_keyboard(),
+        reply_markup=_main_menu_keyboard(is_super),
     )
 
 
@@ -1073,8 +1138,15 @@ async def _cb_template_edit_start(query, context, data: str) -> int:
 # ── Settings ─────────────────────────────────────────────────────────────
 
 async def _cb_settings(query, context) -> None:
+    user = query.from_user
+    if not await _is_super_admin(user.id):
+        await query.answer("⛔ Settings are only accessible by Super Admins.", show_alert=True)
+        return
+
     wa = await _whatsapp_link()
-    cur_pass = await db.get_setting("admin_password") or config.ADMIN_PASSWORD
+    super_pass = await db.get_setting("super_admin_password") or config.SUPER_ADMIN_PASSWORD
+    normal_pass = await db.get_setting("normal_admin_password") or config.NORMAL_ADMIN_PASSWORD
+    tg_supp = config.TELEGRAM_SUPPORT_USERNAME.lstrip("@")
 
     # Get follow-up days
     schedule_lines = []
@@ -1084,9 +1156,11 @@ async def _cb_settings(query, context) -> None:
         schedule_lines.append(f"  Stage {stage}: Day *{days}* ({tpl_key})")
 
     text = (
-        "⚙️ *Bot Settings*\n\n"
+        "⚙️ *Bot Settings (Super Admin Only)*\n\n"
         f"📲 *WhatsApp Link:*\n{wa}\n\n"
-        f"🔑 *Admin Passcode:* `{cur_pass}`\n\n"
+        f"💬 *Support Username:* @{tg_supp}\n\n"
+        f"👑 *Super Admin Passcode:* `{super_pass}`\n"
+        f"🔑 *Normal Admin Passcode:* `{normal_pass}`\n\n"
         f"📅 *Follow-up Schedule:*\n"
         + "\n".join(schedule_lines)
     )
@@ -1100,7 +1174,15 @@ async def _cb_settings(query, context) -> None:
             ],
             [
                 InlineKeyboardButton(
-                    "🔑 Change Admin Passcode", callback_data="st:pass"
+                    "👑 Change Super Passcode", callback_data="st:spass"
+                ),
+                InlineKeyboardButton(
+                    "🔑 Change Team Passcode", callback_data="st:npass"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🚪 Log Out All Admins", callback_data="st:clear_admins"
                 )
             ],
             [InlineKeyboardButton("🔙 Back", callback_data="m")],
@@ -1121,14 +1203,37 @@ async def _cb_set_whatsapp_start(query, context) -> int:
     return STATE_SET_WHATSAPP
 
 
-async def _cb_set_password_start(query, context) -> int:
+async def _cb_set_super_password_start(query, context) -> int:
     await query.edit_message_text(
-        "🔑 *Change Admin Passcode*\n\n"
-        "Send the new passcode/password for admin access.\n\n"
+        "👑 *Change Super Admin Passcode*\n\n"
+        "Send the new passcode for Super Admin (Owner) access.\n\n"
         "Send /cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    return STATE_SET_PASSWORD
+    return STATE_SET_SUPER_PASSWORD
+
+
+async def _cb_set_normal_password_start(query, context) -> int:
+    await query.edit_message_text(
+        "🔑 *Change Normal Admin Passcode*\n\n"
+        "Send the new passcode for Normal Admin (Staff / Team) access.\n\n"
+        "Send /cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return STATE_SET_NORMAL_PASSWORD
+
+
+async def _cb_clear_admins(query, context) -> None:
+    await db.clear_all_admins()
+    await query.edit_message_text(
+        "🚪 *All Admins Logged Out!*\n\n"
+        "All active admin sessions have been revoked.\n"
+        "Anyone who needs access must re-enter the passcode using /admin.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 Dashboard", callback_data="m")]]
+        ),
+    )
 
 
 # ── Broadcast ────────────────────────────────────────────────────────────
@@ -1454,17 +1559,36 @@ async def _text_set_whatsapp(
     return ConversationHandler.END
 
 
-async def _text_set_password(
+async def _text_set_super_password(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     new_pass = update.message.text.strip()
     if not new_pass:
         await update.message.reply_text("❌ Passcode cannot be empty.")
-        return STATE_SET_PASSWORD
+        return STATE_SET_SUPER_PASSWORD
 
-    await db.set_setting("admin_password", new_pass)
+    await db.set_setting("super_admin_password", new_pass)
     await update.message.reply_text(
-        f"✅ Admin passcode updated to: `{new_pass}`",
+        f"✅ Super Admin passcode updated to: `{new_pass}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 Dashboard", callback_data="m")]]
+        ),
+    )
+    return ConversationHandler.END
+
+
+async def _text_set_normal_password(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    new_pass = update.message.text.strip()
+    if not new_pass:
+        await update.message.reply_text("❌ Passcode cannot be empty.")
+        return STATE_SET_NORMAL_PASSWORD
+
+    await db.set_setting("normal_admin_password", new_pass)
+    await update.message.reply_text(
+        f"✅ Normal Admin passcode updated to: `{new_pass}`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔙 Dashboard", callback_data="m")]]
@@ -1625,13 +1749,11 @@ def main() -> None:
         print("❌ ERROR: BOT_TOKEN not set. Check your .env file.")
         sys.exit(1)
 
-    if not config.SUPER_ADMIN_ID and not config.ADMIN_PASSWORD:
-        print("❌ ERROR: Neither SUPER_ADMIN_ID nor ADMIN_PASSWORD set in .env file.")
-        print("   Set at least ADMIN_PASSWORD (e.g. ADMIN_PASSWORD=ADZOHO2026).")
+    if not config.SUPER_ADMIN_PASSWORD:
+        print("❌ ERROR: SUPER_ADMIN_PASSWORD not set in .env file.")
         sys.exit(1)
 
-    logger.info("Admin security initialized. Owner: %d, Passcode set: %s",
-                config.SUPER_ADMIN_ID, bool(config.ADMIN_PASSWORD))
+    logger.info("Admin security initialized with Dual-Tier Passcodes (Super & Normal).")
 
     # Start health server for Render Free Web Service (if PORT is set)
     start_health_server()
@@ -1657,10 +1779,16 @@ def main() -> None:
                     filters.TEXT & ~filters.COMMAND, _handle_auth_password
                 ),
             ],
-            STATE_SET_PASSWORD: [
+            STATE_SET_SUPER_PASSWORD: [
                 CommandHandler("cancel", _cancel),
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, _text_set_password
+                    filters.TEXT & ~filters.COMMAND, _text_set_super_password
+                ),
+            ],
+            STATE_SET_NORMAL_PASSWORD: [
+                CommandHandler("cancel", _cancel),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, _text_set_normal_password
                 ),
             ],
             STATE_EDIT_TEMPLATE: [
@@ -1712,6 +1840,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", handle_help))
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CommandHandler("whatsapp", handle_whatsapp))
+    app.add_handler(CommandHandler("telegramsupport", handle_telegram_support))
     app.add_handler(conv_handler)
 
     # ── Run ──────────────────────────────────────────────────────────

@@ -9,8 +9,12 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: ADMIN_PASSWORD
-        value: ADZOHO2026
+      - key: SUPER_ADMIN_PASSWORD
+        value: ADZOHO_SUPER_2026
+      - key: NORMAL_ADMIN_PASSWORD
+        value: ADZOHO_ADMIN_2026
+      - key: TELEGRAM_SUPPORT_USERNAME
+        value: Adzoho
       - key: WHATSAPP_LINK
         value: https://wa.me/15819052863
       - key: DATABASE_PATH

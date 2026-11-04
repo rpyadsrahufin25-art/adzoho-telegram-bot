@@ -371,6 +371,13 @@ class Database:
         ) as cur:
             return (await cur.fetchone()) is not None
 
+    async def is_super_admin(self, user_id: int) -> bool:
+        async with self._db.execute(
+            "SELECT is_super FROM admins WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return bool(row["is_super"]) if row else False
+
     async def add_admin(
         self, user_id: int, username: str | None, is_super: bool = False
     ) -> None:
@@ -379,6 +386,22 @@ class Database:
                VALUES (?, ?, ?, ?)""",
             (user_id, username, int(is_super), self._now()),
         )
+        await self._db.commit()
+
+    async def add_or_update_admin(
+        self, user_id: int, username: str | None, is_super: bool = False
+    ) -> None:
+        await self._db.execute(
+            """INSERT INTO admins (user_id, username, is_super, added_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET is_super = MAX(is_super, excluded.is_super), username = excluded.username""",
+            (user_id, username, int(is_super), self._now()),
+        )
+        await self._db.commit()
+
+    async def clear_all_admins(self) -> None:
+        """Revoke all active admin sessions."""
+        await self._db.execute("DELETE FROM admins")
         await self._db.commit()
 
     async def remove_admin(self, user_id: int) -> None:

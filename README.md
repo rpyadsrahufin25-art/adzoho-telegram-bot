@@ -110,14 +110,14 @@ Create a private GitHub repository and push this `adzoho-bot` directory.
    - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `python bot.py`
 5. Under **Environment Variables**, add:
-   - `BOT_TOKEN`: `your_telegram_bot_token`
-   - `ADMIN_PASSWORD`: `ADZOHO2026`
+   - `BOT_TOKEN`: `9052617342:AAEY-K5rmBSkg1I5ayH4g7vA5atnmSEK5ZE`
+   - `SUPER_ADMIN_PASSWORD`: `ADZOHO_SUPER_2026`
+   - `NORMAL_ADMIN_PASSWORD`: `ADZOHO_ADMIN_2026`
+   - `TELEGRAM_SUPPORT_USERNAME`: `Adzoho`
    - `WHATSAPP_LINK`: `https://wa.me/15819052863`
    - `DATABASE_PATH`: `adzoho_bot.db`
    - `LOG_LEVEL`: `INFO`
 6. Click **Create Web Service**!
-
-The bot runs a lightweight HTTP health check endpoint on `$PORT` so Render recognizes it as an active Web Service. The bot also automatically pings its own URL every 10 minutes to prevent Render's free tier from sleeping!
 
 ---
 
@@ -129,12 +129,13 @@ The bot runs a lightweight HTTP health check endpoint on `$PORT` so Render recog
 | `/start` | Start the bot |
 | `/help` | Show help text |
 | `/whatsapp` | Get the WhatsApp link |
+| `/telegramsupport` | Direct chat with @Adzoho on Telegram |
 | `/stop` | Opt out of all messages |
 
 ### Admin commands
 | Command | Description |
 |---|---|
-| `/admin` | Open admin dashboard (prompts for passcode if not logged in) |
+| `/admin` | Open admin dashboard (prompts for Super or Normal passcode) |
 
 ---
 
