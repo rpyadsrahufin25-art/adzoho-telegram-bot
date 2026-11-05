@@ -77,8 +77,36 @@ PER_PAGE = 8  # leads per page in admin list
 # Health Server (Enables 100% FREE deployment on Render Web Services)
 # ═════════════════════════════════════════════════════════════════════════
 
+LOG_BUFFER: list[str] = []
+
+
+class BufferLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            LOG_BUFFER.append(msg)
+            if len(LOG_BUFFER) > 250:
+                LOG_BUFFER.pop(0)
+        except Exception:
+            pass
+
+
+_buffer_handler = BufferLogHandler()
+_buffer_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(name)-18s | %(levelname)-7s | %(message)s")
+)
+logging.getLogger().addHandler(_buffer_handler)
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/logs"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            data = "\n".join(LOG_BUFFER) if LOG_BUFFER else "No logs recorded yet."
+            self.wfile.write(data.encode("utf-8"))
+            return
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -423,30 +451,13 @@ async def handle_join_request(
     """Auto-approve the channel join request, send welcome, schedule follow-ups."""
     request: ChatJoinRequest = update.chat_join_request
     user = request.from_user
-    target_chat_id = getattr(request, "user_chat_id", None) or user.id
 
     logger.info(
-        "Join request received from user %d (@%s, name=%s) for chat %d (target_chat_id=%s)",
-        user.id, user.username, user.first_name, request.chat.id, target_chat_id,
+        "Join request received from user %d (@%s, name=%s) for chat %d",
+        user.id, user.username, user.first_name, request.chat.id,
     )
 
-    # 1) Send welcome DM FIRST using target_chat_id while join request grants active contact rights
-    welcome_sent = False
-    lead = await db.get_lead(user.id)
-    if lead and lead.get("opted_out"):
-        logger.info("Lead %d has opted out, skipping welcome message.", user.id)
-    else:
-        text = await _render("welcome", user.first_name)
-        if text:
-            wa_kb = await _whatsapp_button()
-            welcome_sent = await _send_safe_message(context, target_chat_id, text, wa_kb)
-            if welcome_sent:
-                await db.log_message(user.id, "welcome")
-                logger.info("Delivered welcome DM to user %d", user.id)
-            else:
-                logger.warning("Could not deliver welcome DM to target_chat_id %d", target_chat_id)
-
-    # 2) Approve the join request
+    # 1) Auto-approve the join request immediately
     try:
         await request.approve()
         logger.info(
@@ -456,21 +467,47 @@ async def handle_join_request(
     except Exception as e:
         logger.error("Failed to approve join request: %s", e)
 
-    # 3) Register or update lead in DB
-    await db.add_lead(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        source_chat_id=request.chat.id,
-    )
-    if welcome_sent:
-        await db.update_lead_last_message(user.id)
+    # 2) Register or update lead in DB
+    try:
+        await db.add_lead(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            source_chat_id=request.chat.id,
+        )
+    except Exception as e:
+        logger.error("Failed to register lead %d: %s", user.id, e)
+
+    # 3) Send welcome message with WhatsApp button
+    welcome_sent = False
+    try:
+        lead = await db.get_lead(user.id)
+        if not (lead and lead.get("opted_out")):
+            text = await _render("welcome", user.first_name)
+            if text:
+                wa_kb = await _whatsapp_button()
+                target_chat_id = getattr(request, "user_chat_id", None) or user.id
+                welcome_sent = await _send_safe_message(context, target_chat_id, text, wa_kb)
+                if not welcome_sent and target_chat_id != user.id:
+                    welcome_sent = await _send_safe_message(context, user.id, text, wa_kb)
+
+                if welcome_sent:
+                    await db.log_message(user.id, "welcome")
+                    await db.update_lead_last_message(user.id)
+                    logger.info("Delivered welcome DM to user %d", user.id)
+                else:
+                    logger.warning("Could not deliver welcome DM to user %d", user.id)
+    except Exception as e:
+        logger.error("Error in welcome delivery for %d: %s", user.id, e)
 
     # 4) Schedule follow-ups if lead is active
-    lead = await db.get_lead(user.id)
-    if lead and not lead.get("opted_out") and lead.get("status") not in config.TERMINAL_STATUSES:
-        await schedule_followups(user.id, context.application)
+    try:
+        lead = await db.get_lead(user.id)
+        if lead and not lead.get("opted_out") and lead.get("status") not in config.TERMINAL_STATUSES:
+            await schedule_followups(user.id, context.application)
+    except Exception as e:
+        logger.error("Error scheduling followups for %d: %s", user.id, e)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -641,7 +678,9 @@ def _main_menu_keyboard(is_super: bool = True) -> InlineKeyboardMarkup:
 
 async def _show_dashboard(update: Update) -> None:
     user = update.effective_user
-    is_super = await _is_super_admin(user.id) if user else False
+    if not user:
+        return
+    is_super = await _is_super_admin(user.id)
     role_badge = "👑 *Super Admin*" if is_super else "🔑 *Team Admin*"
 
     stats = await db.get_lead_stats()
@@ -655,19 +694,20 @@ async def _show_dashboard(update: Update) -> None:
         if cnt:
             text += f"  {_status_emoji(status_name)} {status_name}: *{cnt}*\n"
 
-    msg = update.effective_message
-    if msg:
-        try:
-            await msg.reply_text(
-                text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_main_menu_keyboard(is_super),
-            )
-        except Exception:
-            await msg.reply_text(
-                text.replace("*", ""),
-                reply_markup=_main_menu_keyboard(is_super),
-            )
+    try:
+        await update.get_bot().send_message(
+            chat_id=user.id,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_main_menu_keyboard(is_super),
+        )
+    except Exception:
+        clean_text = text.replace("*", "")
+        await update.get_bot().send_message(
+            chat_id=user.id,
+            text=clean_text,
+            reply_markup=_main_menu_keyboard(is_super),
+        )
 
 
 async def admin_panel(
@@ -677,19 +717,76 @@ async def admin_panel(
     if not user:
         return ConversationHandler.END
 
+    logger.info("Admin command invoked by user %d (@%s)", user.id, user.username)
+
+    # 1) Support direct authentication via command arguments: /admin <passcode>
+    if context.args:
+        entered_pass = " ".join(context.args).strip()
+        super_pass = await db.get_setting("super_admin_password") or config.SUPER_ADMIN_PASSWORD
+        normal_pass = await db.get_setting("normal_admin_password") or config.NORMAL_ADMIN_PASSWORD
+
+        try:
+            if update.effective_message:
+                await update.effective_message.delete()
+        except Exception:
+            pass
+
+        if entered_pass == super_pass:
+            await db.add_or_update_admin(user.id, user.username, is_super=True)
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    f"👑 *Super Admin Access Granted!*\n\n"
+                    f"Welcome, {html.escape(user.first_name or 'Owner')}!\n"
+                    f"Opening dashboard..."
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await _show_dashboard(update)
+            return ConversationHandler.END
+        elif entered_pass == normal_pass:
+            await db.add_or_update_admin(user.id, user.username, is_super=False)
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    f"🔑 *Team Admin Access Granted!*\n\n"
+                    f"Welcome, {html.escape(user.first_name or 'Admin')}!\n"
+                    f"Opening dashboard..."
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await _show_dashboard(update)
+            return ConversationHandler.END
+        else:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="❌ Incorrect passcode. Access denied.",
+            )
+            return ConversationHandler.END
+
+    # 2) If user is already authenticated in database, show dashboard immediately
     if await _is_admin(user.id):
         await _show_dashboard(update)
         return ConversationHandler.END
 
-    msg = update.effective_message
-    if msg:
-        await msg.reply_text(
-            "🔐 *ADZOHO Admin Authentication*\n\n"
-            "Please enter your admin passcode to access the dashboard:\n"
-            "• *Super Admin Passcode* (Full owner privileges)\n"
-            "• *Normal Admin Passcode* (Team / Staff access)\n\n"
-            "_(Send /cancel to abort)_",
+    # 3) Otherwise, prompt for the admin passcode
+    prompt_text = (
+        "🔐 *ADZOHO Admin Authentication*\n\n"
+        "Please enter your admin passcode to access the dashboard:\n"
+        "• *Super Admin Passcode* (Full owner privileges)\n"
+        "• *Normal Admin Passcode* (Team / Staff access)\n\n"
+        "_(Send /cancel to abort)_"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=prompt_text,
             parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=prompt_text.replace("*", "").replace("_", ""),
         )
     return STATE_AUTH_PASSWORD
 
@@ -706,6 +803,7 @@ async def _handle_auth_password(
     super_pass = await db.get_setting("super_admin_password") or config.SUPER_ADMIN_PASSWORD
     normal_pass = await db.get_setting("normal_admin_password") or config.NORMAL_ADMIN_PASSWORD
 
+    # Delete sensitive password from chat immediately
     try:
         await msg.delete()
     except Exception:
@@ -713,10 +811,13 @@ async def _handle_auth_password(
 
     if entered_pass == super_pass:
         await db.add_or_update_admin(user.id, user.username, is_super=True)
-        await msg.reply_text(
-            f"👑 *Super Admin Access Granted!*\n\n"
-            f"Welcome, {html.escape(user.first_name or 'Owner')}! You have full owner privileges.\n"
-            f"Use /admin anytime to open your dashboard.",
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"👑 *Super Admin Access Granted!*\n\n"
+                f"Welcome, {html.escape(user.first_name or 'Owner')}! You have full owner privileges.\n"
+                f"Use /admin anytime to open your dashboard."
+            ),
             parse_mode=ParseMode.MARKDOWN,
         )
         await _show_dashboard(update)
@@ -724,17 +825,23 @@ async def _handle_auth_password(
 
     elif entered_pass == normal_pass:
         await db.add_or_update_admin(user.id, user.username, is_super=False)
-        await msg.reply_text(
-            f"🔑 *Team Admin Access Granted!*\n\n"
-            f"Welcome, {html.escape(user.first_name or 'Admin')}! You have team admin access.\n"
-            f"Use /admin anytime to open your dashboard.",
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"🔑 *Team Admin Access Granted!*\n\n"
+                f"Welcome, {html.escape(user.first_name or 'Admin')}! You have team admin access.\n"
+                f"Use /admin anytime to open your dashboard."
+            ),
             parse_mode=ParseMode.MARKDOWN,
         )
         await _show_dashboard(update)
         return ConversationHandler.END
 
     else:
-        await msg.reply_text("❌ Incorrect passcode. Access denied.")
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="❌ Incorrect passcode. Access denied. Type /admin to try again.",
+        )
         return ConversationHandler.END
 
 
@@ -1840,42 +1947,49 @@ def main() -> None:
         states={
             STATE_AUTH_PASSWORD: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _handle_auth_password
                 ),
             ],
             STATE_SET_SUPER_PASSWORD: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_set_super_password
                 ),
             ],
             STATE_SET_NORMAL_PASSWORD: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_set_normal_password
                 ),
             ],
             STATE_EDIT_TEMPLATE: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_edit_template
                 ),
             ],
             STATE_BROADCAST: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_broadcast
                 ),
             ],
             STATE_SET_WHATSAPP: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_set_whatsapp
                 ),
             ],
             STATE_ADD_ADMIN: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,
                     _text_add_admin,
@@ -1883,18 +1997,25 @@ def main() -> None:
             ],
             STATE_ADD_NOTE: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_add_note
                 ),
             ],
             STATE_SEARCH: [
                 CommandHandler("cancel", _cancel),
+                CommandHandler("admin", admin_panel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, _text_search
                 ),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel)],
+        fallbacks=[
+            CommandHandler("cancel", _cancel),
+            CommandHandler("admin", admin_panel),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
         per_message=False,
     )
 
@@ -1907,6 +2028,7 @@ def main() -> None:
     app.add_handler(CommandHandler("whatsapp", handle_whatsapp))
     app.add_handler(CommandHandler("telegramsupport", handle_telegram_support))
     app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("admin", admin_panel))
 
     # ── Run ──────────────────────────────────────────────────────────
     logger.info("🚀 Starting ADZOHO Bot…")
