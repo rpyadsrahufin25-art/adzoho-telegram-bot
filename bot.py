@@ -2033,11 +2033,7 @@ def main() -> None:
     # ── Run ──────────────────────────────────────────────────────────
     logger.info("🚀 Starting ADZOHO Bot…")
     app.run_polling(
-        allowed_updates=[
-            "message",
-            "callback_query",
-            "chat_join_request",
-        ],
+        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )
 
