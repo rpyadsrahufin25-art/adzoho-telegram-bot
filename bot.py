@@ -2038,7 +2038,7 @@ def main() -> None:
             "callback_query",
             "chat_join_request",
         ],
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
 
 
