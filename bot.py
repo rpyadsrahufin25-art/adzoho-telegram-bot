@@ -107,6 +107,37 @@ class HealthHandler(BaseHTTPRequestHandler):
             data = "\n".join(LOG_BUFFER) if LOG_BUFFER else "No logs recorded yet."
             self.wfile.write(data.encode("utf-8"))
             return
+        if self.path.startswith("/status"):
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            import json, sqlite3
+            try:
+                con = sqlite3.connect(config.DATABASE_PATH)
+                con.row_factory = sqlite3.Row
+                leads = [
+                    dict(r)
+                    for r in con.execute(
+                        "SELECT user_id, username, first_name, status, join_date, next_followup, followup_stage FROM leads ORDER BY created_at DESC LIMIT 50"
+                    ).fetchall()
+                ]
+                logs = [
+                    dict(r)
+                    for r in con.execute(
+                        "SELECT user_id, template_key, stage, sent_at FROM message_log ORDER BY sent_at DESC LIMIT 20"
+                    ).fetchall()
+                ]
+                con.close()
+                data = {
+                    "status": "online",
+                    "total_leads": len(leads),
+                    "leads": leads,
+                    "recent_messages": logs,
+                }
+                self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+            except Exception as e:
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode("utf-8"))
+            return
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -393,6 +424,14 @@ async def _execute_followup(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(
             "Duplicate guard: %s already sent to %d", template_key, user_id
         )
+        further = stage + 1
+        if further in STAGE_TEMPLATE_MAP:
+            join_dt = datetime.fromisoformat(lead["join_date"])
+            days = await _get_followup_days(further)
+            next_dt = join_dt + timedelta(days=days)
+            await db.update_lead_followup(user_id, stage, next_dt.isoformat())
+        else:
+            await db.update_lead_followup(user_id, stage, None)
         return
 
     text = await _render(template_key, lead["first_name"])
@@ -431,6 +470,76 @@ async def _execute_followup(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def due_followup_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Recurring background worker running every 60 seconds.
+    Queries the database for leads whose next_followup is due (<= now).
+    Guarantees follow-ups are NEVER missed across server reboots, sleep cycles, or downtime.
+    """
+    try:
+        due_leads = await db.get_pending_followups()
+        if not due_leads:
+            return
+
+        logger.info("Due-worker: Found %d due follow-up(s) to process", len(due_leads))
+        for lead in due_leads:
+            user_id = lead["user_id"]
+            current_stage = lead["followup_stage"]
+            next_stage = current_stage + 1
+
+            if next_stage not in STAGE_TEMPLATE_MAP:
+                await db.update_lead_followup(user_id, current_stage, None)
+                continue
+
+            template_key = STAGE_TEMPLATE_MAP[next_stage]
+
+            # Duplicate check
+            if await db.was_message_sent(user_id, template_key):
+                further = next_stage + 1
+                if further in STAGE_TEMPLATE_MAP:
+                    join_dt = datetime.fromisoformat(lead["join_date"])
+                    days = await _get_followup_days(further)
+                    next_dt = join_dt + timedelta(days=days)
+                    await db.update_lead_followup(user_id, next_stage, next_dt.isoformat())
+                else:
+                    await db.update_lead_followup(user_id, next_stage, None)
+                continue
+
+            text = await _render(template_key, lead["first_name"])
+            if not text:
+                continue
+
+            wa_kb = await _whatsapp_button()
+            sent = await _send_safe_message(context, user_id, text, wa_kb)
+            if sent:
+                await db.log_message(user_id, template_key, next_stage)
+                await db.update_lead_last_message(user_id)
+
+                further = next_stage + 1
+                if further in STAGE_TEMPLATE_MAP:
+                    join_dt = datetime.fromisoformat(lead["join_date"])
+                    days = await _get_followup_days(further)
+                    next_dt = join_dt + timedelta(days=days)
+                    await db.update_lead_followup(user_id, next_stage, next_dt.isoformat())
+                else:
+                    await db.update_lead_followup(user_id, next_stage, None)
+
+                if lead["status"] == "New":
+                    await db.update_lead_status(user_id, "Contacted")
+
+                logger.info(
+                    "✅ Due-worker sent followup stage %d (%s) to user %d",
+                    next_stage, template_key, user_id,
+                )
+            else:
+                logger.warning(
+                    "⚠️ Due-worker failed to send followup stage %d to user %d",
+                    next_stage, user_id,
+                )
+    except Exception as e:
+        logger.error("Error in due_followup_worker: %s", e)
+
+
 async def _reload_pending_followups(application: Application) -> None:
     """On startup, reload all pending follow-ups from the database."""
     leads = await db.get_leads_with_pending_followups()
@@ -439,6 +548,16 @@ async def _reload_pending_followups(application: Application) -> None:
         await schedule_followups(lead["user_id"], application)
         count += 1
     logger.info("Reloaded follow-ups for %d leads", count)
+
+    # Check for existing active leads where next_followup is None (e.g. joined via /start)
+    active_leads = await db.get_all_active_leads()
+    fixed_count = 0
+    for lead in active_leads:
+        if lead.get("next_followup") is None and lead.get("followup_stage", 0) < len(STAGE_TEMPLATE_MAP):
+            await schedule_followups(lead["user_id"], application)
+            fixed_count += 1
+    if fixed_count > 0:
+        logger.info("Initialized missing follow-up dates for %d active leads", fixed_count)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -457,17 +576,7 @@ async def handle_join_request(
         user.id, user.username, user.first_name, request.chat.id,
     )
 
-    # 1) Auto-approve the join request immediately
-    try:
-        await request.approve()
-        logger.info(
-            "Approved join request: %d (@%s) for chat %d",
-            user.id, user.username, request.chat.id,
-        )
-    except Exception as e:
-        logger.error("Failed to approve join request: %s", e)
-
-    # 2) Register or update lead in DB
+    # 1) Register or update lead in DB
     try:
         await db.add_lead(
             user_id=user.id,
@@ -479,7 +588,8 @@ async def handle_join_request(
     except Exception as e:
         logger.error("Failed to register lead %d: %s", user.id, e)
 
-    # 3) Send welcome message with WhatsApp button
+    # 2) Send welcome message with WhatsApp button BEFORE approving
+    # Telegram allows messaging request.user_chat_id while the join request is pending!
     welcome_sent = False
     try:
         lead = await db.get_lead(user.id)
@@ -500,6 +610,16 @@ async def handle_join_request(
                     logger.warning("Could not deliver welcome DM to user %d", user.id)
     except Exception as e:
         logger.error("Error in welcome delivery for %d: %s", user.id, e)
+
+    # 3) Auto-approve the join request (always executed)
+    try:
+        await request.approve()
+        logger.info(
+            "Approved join request: %d (@%s) for chat %d",
+            user.id, user.username, request.chat.id,
+        )
+    except Exception as e:
+        logger.error("Failed to approve join request: %s", e)
 
     # 4) Schedule follow-ups if lead is active
     try:
@@ -538,6 +658,14 @@ async def handle_start(
     )
     if update.message:
         await _send_safe_message(context, user.id, text, wa_kb)
+
+    # Schedule follow-ups for lead
+    try:
+        lead = await db.get_lead(user.id)
+        if lead and not lead.get("opted_out") and lead.get("status") not in config.TERMINAL_STATUSES:
+            await schedule_followups(user.id, context.application)
+    except Exception as e:
+        logger.error("Error scheduling followups on /start for %d: %s", user.id, e)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -648,15 +776,18 @@ def _main_menu_keyboard(is_super: bool = True) -> InlineKeyboardMarkup:
                     InlineKeyboardButton("👥 Leads", callback_data="l:1"),
                 ],
                 [
+                    InlineKeyboardButton("⏱️ Follow-ups Queue", callback_data="fq"),
                     InlineKeyboardButton("📝 Templates", callback_data="t"),
-                    InlineKeyboardButton("⚙️ Settings", callback_data="st"),
                 ],
                 [
                     InlineKeyboardButton("📢 Broadcast", callback_data="bc"),
-                    InlineKeyboardButton("📥 Export CSV", callback_data="ex"),
+                    InlineKeyboardButton("⚙️ Settings", callback_data="st"),
                 ],
                 [
                     InlineKeyboardButton("🔍 Search", callback_data="sr"),
+                    InlineKeyboardButton("📥 Export CSV", callback_data="ex"),
+                ],
+                [
                     InlineKeyboardButton("👤 Admins", callback_data="ad"),
                 ],
             ]
@@ -669,7 +800,10 @@ def _main_menu_keyboard(is_super: bool = True) -> InlineKeyboardMarkup:
                     InlineKeyboardButton("👥 Leads", callback_data="l:1"),
                 ],
                 [
+                    InlineKeyboardButton("⏱️ Follow-ups Queue", callback_data="fq"),
                     InlineKeyboardButton("📝 Templates", callback_data="t"),
+                ],
+                [
                     InlineKeyboardButton("🔍 Search", callback_data="sr"),
                 ],
             ]
@@ -936,6 +1070,16 @@ async def handle_callback(
     # ── Manual followup ──────────────────────────────────────────────
     if data.startswith("mf:"):
         return await _cb_manual_followup(query, context, data)
+
+    # ── Follow-up Queue & Tests ──────────────────────────────────────
+    if data == "fq":
+        return await _cb_followups_queue(query, context)
+    if data == "fq:run":
+        return await _cb_followup_run_now(query, context)
+    if data == "fq:test":
+        return await _cb_followup_test_menu(query, context)
+    if data.startswith("fq:send_test:"):
+        return await _cb_followup_send_test(query, context, data)
 
     return None
 
@@ -1645,6 +1789,136 @@ async def _cb_manual_followup(query, context, data: str) -> None:
         await query.answer("❌ Failed to send follow-up message", show_alert=True)
 
 
+# ── Follow-up Queue & Testing ──────────────────────────────────────────
+
+async def _cb_followups_queue(query, context) -> None:
+    pending = await db.get_pending_followups()
+    leads_with_followup = await db.get_leads_with_pending_followups()
+
+    text = (
+        "⏱️ *ADZOHO Follow-ups Queue*\n\n"
+        f"📊 *Due Right Now:* {len(pending)}\n"
+        f"📅 *Total in Follow-up Pipeline:* {len(leads_with_followup)}\n\n"
+    )
+    if pending:
+        text += "🚨 *Due Now (Will be processed automatically):*\n"
+        for l in pending[:5]:
+            nxt_stage = l["followup_stage"] + 1
+            tpl = STAGE_TEMPLATE_MAP.get(nxt_stage, "?")
+            user_name = f"@{l['username']}" if l.get("username") else f"ID {l['user_id']}"
+            text += f"• {user_name} — Stage {nxt_stage} ({tpl})\n"
+        text += "\n"
+
+    if leads_with_followup:
+        text += "🗓️ *Next Scheduled Follow-ups:*\n"
+        for l in leads_with_followup[:6]:
+            nxt_stage = l["followup_stage"] + 1
+            tpl = STAGE_TEMPLATE_MAP.get(nxt_stage, "?")
+            due_str = (l.get("next_followup") or "")[:16].replace("T", " ")
+            user_name = f"@{l['username']}" if l.get("username") else f"ID {l['user_id']}"
+            text += f"• {user_name} — Stage {nxt_stage} at `{due_str}` UTC\n"
+    else:
+        text += "ℹ️ _No leads currently have pending follow-ups._\n"
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⚡ Run Due Follow-ups Now", callback_data="fq:run")],
+            [InlineKeyboardButton("🧪 Test Follow-up on Myself", callback_data="fq:test")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="m")],
+        ]
+    )
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+    )
+
+
+async def _cb_followup_run_now(query, context) -> None:
+    await query.answer("⚡ Running due follow-up checks...", show_alert=False)
+    await due_followup_worker(context)
+    await _cb_followups_queue(query, context)
+
+
+async def _cb_followup_test_menu(query, context) -> None:
+    text = (
+        "🧪 *Test Follow-up Delivery*\n\n"
+        "Tap a stage below to send that exact message template to your private chat right now "
+        "(with your name and WhatsApp button).\n\n"
+        "This lets you preview exactly what leads receive!"
+    )
+    buttons = []
+    for stage in sorted(STAGE_TEMPLATE_MAP.keys()):
+        days = await _get_followup_days(stage)
+        tpl = STAGE_TEMPLATE_MAP[stage]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Stage {stage} (Day {days}): {tpl}",
+                    callback_data=f"fq:send_test:{stage}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="fq")])
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def _cb_followup_send_test(query, context, data: str) -> None:
+    stage = int(data.split(":")[2])
+    template_key = STAGE_TEMPLATE_MAP.get(stage, "followup_day2")
+    user = query.from_user
+    text = await _render(template_key, user.first_name)
+    wa_kb = await _whatsapp_button()
+    sent = await _send_safe_message(context, user.id, text, wa_kb)
+    if sent:
+        await query.answer(
+            f"✅ Sent Stage {stage} ({template_key}) test to your DM!", show_alert=True
+        )
+    else:
+        await query.answer(
+            "❌ Could not deliver to your DM. Have you opened a chat with the bot?",
+            show_alert=True,
+        )
+
+
+async def handle_test_followup(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    if not user or not await _is_admin(user.id):
+        return
+    stage = 1
+    if context.args:
+        try:
+            stage = int(context.args[0])
+        except ValueError:
+            pass
+    if stage not in STAGE_TEMPLATE_MAP:
+        stage = 1
+    template_key = STAGE_TEMPLATE_MAP[stage]
+    text = await _render(template_key, user.first_name)
+    wa_kb = await _whatsapp_button()
+    sent = await _send_safe_message(context, user.id, text, wa_kb)
+    if update.message:
+        if sent:
+            await update.message.reply_text(
+                f"✅ Sent Stage {stage} ({template_key}) test message to your DM!"
+            )
+        else:
+            await update.message.reply_text("❌ Could not deliver message to your DM.")
+
+
+async def handle_run_followups(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    if not user or not await _is_admin(user.id):
+        return
+    await due_followup_worker(context)
+    if update.message:
+        await update.message.reply_text("⚡ Checked follow-up queue and processed all due messages.")
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # CONVERSATION HANDLER: text input states
 # ═════════════════════════════════════════════════════════════════════════
@@ -1884,6 +2158,15 @@ async def post_init(application: Application) -> None:
     await _seed_defaults()
     await _reload_pending_followups(application)
 
+    # Recurring due-followups worker: runs every 60 seconds to ensure follow-ups are never missed
+    application.job_queue.run_repeating(
+        due_followup_worker,
+        interval=60,
+        first=5,
+        name="due_followup_worker",
+    )
+    logger.info("Scheduled recurring due-followups worker (every 60s) ✅")
+
     # Set public commands only (keeping /admin completely hidden)
     try:
         await application.bot.set_my_commands([
@@ -1896,10 +2179,10 @@ async def post_init(application: Application) -> None:
     except Exception as e:
         logger.debug("Could not set bot commands: %s", e)
 
-    # Prevent Render free tier from sleeping by self-pinging every 10 minutes
+    # Prevent Render free tier from sleeping by self-pinging every 5 minutes
     if os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PING_URL"):
-        application.job_queue.run_repeating(_self_ping, interval=600, first=60)
-        logger.info("Scheduled keep-alive self-ping every 10 minutes (Render Free tier mode)")
+        application.job_queue.run_repeating(_self_ping, interval=300, first=30)
+        logger.info("Scheduled keep-alive self-ping every 5 minutes (Render Free tier mode)")
     logger.info("ADZOHO bot initialized ✅")
 
 
@@ -2027,6 +2310,8 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", handle_stop))
     app.add_handler(CommandHandler("whatsapp", handle_whatsapp))
     app.add_handler(CommandHandler("telegramsupport", handle_telegram_support))
+    app.add_handler(CommandHandler("testfollowup", handle_test_followup))
+    app.add_handler(CommandHandler("runfollowups", handle_run_followups))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("admin", admin_panel))
 
