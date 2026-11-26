@@ -193,7 +193,7 @@ async def _telegram_button() -> InlineKeyboardMarkup:
     clean_username = username.lstrip("@")
     url = f"https://t.me/{clean_username}"
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"✈️ Contact @{clean_username} on Telegram", url=url)]]
+        [[InlineKeyboardButton("✈️ Message on Telegram", url=url)]]
     )
 
 
