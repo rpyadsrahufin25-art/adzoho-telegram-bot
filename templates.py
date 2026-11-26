@@ -2,9 +2,9 @@
 ADZOHO Bot — Default Message Templates
 Seeded into the DB on first run. Admins can edit them at any time via the dashboard.
 
-Placeholders:  {first_name}  {whatsapp_link}  {bot_name}
+Placeholders:  {first_name}  {telegram_link}  {telegram_username}  {whatsapp_link}  {bot_name}
 
-NOTE: The WhatsApp inline button is added AUTOMATICALLY by the bot.
+NOTE: The Telegram inline button (with Telegram logo) is added AUTOMATICALLY by the bot.
       You do NOT need to include the link in the template text, but you
       can if you also want it as plain text.
 """
@@ -25,8 +25,8 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "• Agency Ad Accounts\n"
         "• Digital Marketing & Campaign Management\n"
         "\n"
-        "📲 *Discuss your requirements with our team:*\n"
-        "{whatsapp_link}\n"
+        "✈️ *Discuss your requirements with our team:*\n"
+        "{telegram_link}\n"
         "\n"
         "Let's connect and get your project started! 🚀"
     ),
@@ -40,8 +40,8 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "Our team is ready to discuss your requirements "
         "and help you choose the right solution.\n"
         "\n"
-        "📲 *Contact us on WhatsApp:*\n"
-        "{whatsapp_link}"
+        "✈️ *Contact us on Telegram:*\n"
+        "{telegram_link}"
     ),
     # ── Day 7 ────────────────────────────────────────────────────────
     "followup_day7": (
@@ -50,8 +50,8 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "\n"
         "ADZOHO can help you plan and manage your project.\n"
         "\n"
-        "📲 *Let's discuss your requirements:*\n"
-        "{whatsapp_link}"
+        "✈️ *Let's discuss your requirements on Telegram:*\n"
+        "{telegram_link}"
     ),
     # ── Day 15 ───────────────────────────────────────────────────────
     "followup_day15": (
@@ -61,8 +61,8 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "Whether you need ads, a website, an app, or a Telegram bot — "
         "our team is happy to discuss your goals and pricing.\n"
         "\n"
-        "📲 *Connect with ADZOHO:*\n"
-        "{whatsapp_link}"
+        "✈️ *Connect with ADZOHO on Telegram:*\n"
+        "{telegram_link}"
     ),
     # ── Day 30 ───────────────────────────────────────────────────────
     "followup_day30": (
@@ -72,8 +72,8 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "we're here to help with advertising, development, "
         "and campaign management.\n"
         "\n"
-        "📲 *Discuss your project with us:*\n"
-        "{whatsapp_link}"
+        "✈️ *Discuss your project with us on Telegram:*\n"
+        "{telegram_link}"
     ),
     # ── Day 90 ───────────────────────────────────────────────────────
     "followup_day90": (
@@ -82,10 +82,10 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "Are you currently looking for digital marketing, advertising, "
         "or development services?\n"
         "\n"
-        "If you have a project in mind, contact us to discuss "
+        "If you have a project in mind, contact us on Telegram to discuss "
         "your requirements with our team.\n"
         "\n"
-        "📲 {whatsapp_link}"
+        "✈️ {telegram_link}"
     ),
 }
 

@@ -181,17 +181,25 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _whatsapp_link() -> str:
-    link = await db.get_setting("whatsapp_link")
-    return link or config.WHATSAPP_DEFAULT
+async def _telegram_support_link() -> str:
+    username = await db.get_setting("telegram_support_username") or config.TELEGRAM_SUPPORT_USERNAME
+    clean_username = username.lstrip("@")
+    return f"https://t.me/{clean_username}"
 
 
-async def _whatsapp_button() -> InlineKeyboardMarkup:
-    """Return an inline keyboard with a single WhatsApp contact button."""
-    wa = await _whatsapp_link()
+async def _telegram_button() -> InlineKeyboardMarkup:
+    """Return an inline keyboard with the Telegram contact button and Telegram logo."""
+    username = await db.get_setting("telegram_support_username") or config.TELEGRAM_SUPPORT_USERNAME
+    clean_username = username.lstrip("@")
+    url = f"https://t.me/{clean_username}"
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💬 Chat on WhatsApp", url=wa)]]
+        [[InlineKeyboardButton(f"✈️ Contact @{clean_username} on Telegram", url=url)]]
     )
+
+
+# Contact button & backwards-compatibility alias
+_contact_button = _telegram_button
+_whatsapp_button = _telegram_button
 
 
 async def _render(template_key: str, first_name: str | None) -> str | None:
@@ -199,7 +207,10 @@ async def _render(template_key: str, first_name: str | None) -> str | None:
     text = await db.get_template(template_key)
     if not text:
         return None
-    wa = await _whatsapp_link()
+    tg_url = await _telegram_support_link()
+    username = await db.get_setting("telegram_support_username") or config.TELEGRAM_SUPPORT_USERNAME
+    clean_username = username.lstrip("@")
+
     # Sanitize user first_name so special characters don't break Telegram Markdown parser
     raw_name = first_name or "there"
     safe_name = (
@@ -212,7 +223,9 @@ async def _render(template_key: str, first_name: str | None) -> str | None:
     try:
         return text.format(
             first_name=safe_name,
-            whatsapp_link=wa,
+            whatsapp_link=tg_url,  # maps to Telegram for backward compatibility
+            telegram_link=tg_url,
+            telegram_username=f"@{clean_username}",
             bot_name="ADZOHO",
         )
     except Exception as e:
@@ -304,9 +317,12 @@ async def _seed_defaults() -> None:
         if existing is None:
             await db.set_template(key, text)
             logger.info("Seeded template: %s", key)
+        elif "whatsapp" in existing.lower() or "wa.me" in existing.lower():
+            await db.set_template(key, text)
+            logger.info("Migrated template %s from WhatsApp to Telegram", key)
 
-    if await db.get_setting("whatsapp_link") is None:
-        await db.set_setting("whatsapp_link", config.WHATSAPP_DEFAULT)
+    if await db.get_setting("telegram_support_username") is None:
+        await db.set_setting("telegram_support_username", config.TELEGRAM_SUPPORT_USERNAME)
 
     # Seed follow-up day settings
     for stage, days in config.FOLLOWUP_DAYS.items():
@@ -438,8 +454,8 @@ async def _execute_followup(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
-    wa_kb = await _whatsapp_button()
-    sent = await _send_safe_message(context, user_id, text, wa_kb)
+    contact_kb = await _telegram_button()
+    sent = await _send_safe_message(context, user_id, text, contact_kb)
     if sent:
         await db.log_message(user_id, template_key, stage)
         await db.update_lead_last_message(user_id)
@@ -509,8 +525,8 @@ async def due_followup_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
             if not text:
                 continue
 
-            wa_kb = await _whatsapp_button()
-            sent = await _send_safe_message(context, user_id, text, wa_kb)
+            contact_kb = await _telegram_button()
+            sent = await _send_safe_message(context, user_id, text, contact_kb)
             if sent:
                 await db.log_message(user_id, template_key, next_stage)
                 await db.update_lead_last_message(user_id)
@@ -596,11 +612,11 @@ async def handle_join_request(
         if not (lead and lead.get("opted_out")):
             text = await _render("welcome", user.first_name)
             if text:
-                wa_kb = await _whatsapp_button()
+                contact_kb = await _telegram_button()
                 target_chat_id = getattr(request, "user_chat_id", None) or user.id
-                welcome_sent = await _send_safe_message(context, target_chat_id, text, wa_kb)
+                welcome_sent = await _send_safe_message(context, target_chat_id, text, contact_kb)
                 if not welcome_sent and target_chat_id != user.id:
-                    welcome_sent = await _send_safe_message(context, user.id, text, wa_kb)
+                    welcome_sent = await _send_safe_message(context, user.id, text, contact_kb)
 
                 if welcome_sent:
                     await db.log_message(user.id, "welcome")
@@ -647,7 +663,7 @@ async def handle_start(
         last_name=user.last_name,
     )
 
-    wa_kb = await _whatsapp_button()
+    contact_kb = await _telegram_button()
     safe_name = (user.first_name or "there").replace("*", "").replace("_", "").replace("`", "")
     text = (
         f"👋 Hi *{safe_name}!*\n\n"
@@ -657,7 +673,7 @@ async def handle_start(
         "Type /help for available commands."
     )
     if update.message:
-        await _send_safe_message(context, user.id, text, wa_kb)
+        await _send_safe_message(context, user.id, text, contact_kb)
 
     # Schedule follow-ups for lead
     try:
@@ -679,7 +695,6 @@ async def handle_help(
         "📖 *ADZOHO Bot Commands*\n\n"
         "/start — Start the bot\n"
         "/help — Show this help\n"
-        "/whatsapp — Get our WhatsApp link\n"
         "/telegramsupport — Chat with @Adzoho on Telegram\n"
         "/stop — Opt out of messages"
     )
@@ -693,20 +708,18 @@ async def handle_help(
 async def handle_telegram_support(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    username = config.TELEGRAM_SUPPORT_USERNAME.lstrip("@")
-    url = f"https://t.me/{username}"
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"💬 Contact @{username} on Telegram", url=url)]]
-    )
+    contact_kb = await _telegram_button()
+    username = await db.get_setting("telegram_support_username") or config.TELEGRAM_SUPPORT_USERNAME
+    clean_username = username.lstrip("@")
     text = (
-        f"💬 *ADZOHO Telegram Support*\n\n"
+        f"✈️ *ADZOHO Telegram Support*\n\n"
         f"Need direct assistance or want to discuss a project on Telegram?\n"
-        f"Reach out directly to our team at @{username}.\n\n"
+        f"Reach out directly to our team at @{clean_username}.\n\n"
         f"Tap the button below to open a direct chat! 👇"
     )
     msg = update.effective_message
     if msg:
-        await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=contact_kb)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -728,17 +741,20 @@ async def handle_stop(
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# HANDLER: /whatsapp
+# HANDLER: /whatsapp (redirects to Telegram support)
 # ═════════════════════════════════════════════════════════════════════════
 
 async def handle_whatsapp(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    wa_kb = await _whatsapp_button()
+    contact_kb = await _telegram_button()
+    username = await db.get_setting("telegram_support_username") or config.TELEGRAM_SUPPORT_USERNAME
+    clean_username = username.lstrip("@")
     await update.message.reply_text(
-        "📲 *Chat with ADZOHO on WhatsApp:*\n\nTap the button below to connect with us!",
+        f"✈️ *ADZOHO Support on Telegram:*\n\n"
+        f"We provide direct support right here on Telegram! Tap the button below to connect with @{clean_username}:",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=wa_kb,
+        reply_markup=contact_kb,
     )
 
 
@@ -1445,10 +1461,10 @@ async def _cb_settings(query, context) -> None:
         await query.answer("⛔ Settings are only accessible by Super Admins.", show_alert=True)
         return
 
-    wa = await _whatsapp_link()
+    tg_supp = await db.get_setting("telegram_support_username") or config.TELEGRAM_SUPPORT_USERNAME
+    clean_tg = tg_supp.lstrip("@")
     super_pass = await db.get_setting("super_admin_password") or config.SUPER_ADMIN_PASSWORD
     normal_pass = await db.get_setting("normal_admin_password") or config.NORMAL_ADMIN_PASSWORD
-    tg_supp = config.TELEGRAM_SUPPORT_USERNAME.lstrip("@")
 
     # Get follow-up days
     schedule_lines = []
@@ -1459,8 +1475,8 @@ async def _cb_settings(query, context) -> None:
 
     text = (
         "⚙️ *Bot Settings (Super Admin Only)*\n\n"
-        f"📲 *WhatsApp Link:*\n{wa}\n\n"
-        f"💬 *Support Username:* @{tg_supp}\n\n"
+        f"✈️ *Telegram Support:* @{clean_tg}\n"
+        f"🔗 *Support Link:* `https://t.me/{clean_tg}`\n\n"
         f"👑 *Super Admin Passcode:* `{super_pass}`\n"
         f"🔑 *Normal Admin Passcode:* `{normal_pass}`\n\n"
         f"📅 *Follow-up Schedule:*\n"
@@ -1471,7 +1487,7 @@ async def _cb_settings(query, context) -> None:
         [
             [
                 InlineKeyboardButton(
-                    "📲 Change WhatsApp Link", callback_data="st:wa"
+                    "✈️ Change Support Username", callback_data="st:wa"
                 )
             ],
             [
@@ -1497,8 +1513,8 @@ async def _cb_settings(query, context) -> None:
 
 async def _cb_set_whatsapp_start(query, context) -> int:
     await query.edit_message_text(
-        "📲 Send me the new WhatsApp link.\n"
-        "Format: `https://wa.me/91XXXXXXXXXX`\n\n"
+        "✈️ Send the new Telegram support username.\n"
+        "Example: `Adzoho` or `@Adzoho`\n\n"
         "Send /cancel to abort.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1563,8 +1579,8 @@ async def _cb_broadcast_confirm(query, context) -> None:
     leads = await db.get_all_active_leads()
     sent = 0
     failed = 0
-    wa = await _whatsapp_link()
-    wa_kb = await _whatsapp_button()
+    tg_link = await _telegram_support_link()
+    tg_kb = await _telegram_button()
 
     for lead in leads:
         try:
@@ -1578,10 +1594,11 @@ async def _cb_broadcast_confirm(query, context) -> None:
             )
             msg = text.format(
                 first_name=safe_name,
-                whatsapp_link=wa,
+                whatsapp_link=tg_link,
+                telegram_link=tg_link,
                 bot_name="ADZOHO",
             )
-            ok = await _send_safe_message(context, lead["user_id"], msg, wa_kb)
+            ok = await _send_safe_message(context, lead["user_id"], msg, tg_kb)
             if ok:
                 await db.log_message(lead["user_id"], "broadcast")
                 await db.update_lead_last_message(lead["user_id"])
@@ -1764,8 +1781,8 @@ async def _cb_manual_followup(query, context, data: str) -> None:
         await query.answer("❌ Template not found", show_alert=True)
         return
 
-    wa_kb = await _whatsapp_button()
-    sent = await _send_safe_message(context, user_id, text, wa_kb)
+    contact_kb = await _telegram_button()
+    sent = await _send_safe_message(context, user_id, text, contact_kb)
     if sent:
         await db.log_message(user_id, template_key, next_stage)
         await db.update_lead_last_message(user_id)
@@ -1868,8 +1885,8 @@ async def _cb_followup_send_test(query, context, data: str) -> None:
     template_key = STAGE_TEMPLATE_MAP.get(stage, "followup_day2")
     user = query.from_user
     text = await _render(template_key, user.first_name)
-    wa_kb = await _whatsapp_button()
-    sent = await _send_safe_message(context, user.id, text, wa_kb)
+    contact_kb = await _telegram_button()
+    sent = await _send_safe_message(context, user.id, text, contact_kb)
     if sent:
         await query.answer(
             f"✅ Sent Stage {stage} ({template_key}) test to your DM!", show_alert=True
@@ -1897,8 +1914,8 @@ async def handle_test_followup(
         stage = 1
     template_key = STAGE_TEMPLATE_MAP[stage]
     text = await _render(template_key, user.first_name)
-    wa_kb = await _whatsapp_button()
-    sent = await _send_safe_message(context, user.id, text, wa_kb)
+    contact_kb = await _telegram_button()
+    sent = await _send_safe_message(context, user.id, text, contact_kb)
     if update.message:
         if sent:
             await update.message.reply_text(
@@ -1978,13 +1995,14 @@ async def _text_broadcast(
 async def _text_set_whatsapp(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    link = update.message.text.strip()
-    if not link.startswith("http"):
-        link = f"https://wa.me/{link}"
+    text = update.message.text.strip().lstrip("@")
+    if text.startswith("http"):
+        text = text.split("/")[-1].lstrip("@")
 
-    await db.set_setting("whatsapp_link", link)
+    await db.set_setting("telegram_support_username", text)
     await update.message.reply_text(
-        f"✅ WhatsApp link updated:\n{link}",
+        f"✅ Telegram support username updated to: @{text}\n"
+        f"Support Link: https://t.me/{text}",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔙 Dashboard", callback_data="m")]]
         ),
@@ -2172,7 +2190,6 @@ async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([
             BotCommand("start", "Start the bot"),
             BotCommand("help", "Show help and services"),
-            BotCommand("whatsapp", "Chat on WhatsApp"),
             BotCommand("telegramsupport", "Contact @Adzoho on Telegram"),
             BotCommand("stop", "Opt out of automated messages"),
         ])
